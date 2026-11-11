@@ -9,10 +9,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from minigit import GitError, Repo
+from minigit import GitError, Repo, explain_index, explain_object
 
 INDEX = Path(__file__).with_name("index.html")
 MAX_TEXT = 20_000
+MAX_BYTES = 2048
+
+
+def byte_map(repo, target):
+    data, segments = explain_index(repo) if target == "index" else explain_object(repo, repo.resolve(target))
+    shown = [s for s in segments if s["offset"] < MAX_BYTES]
+    return {"target": target, "size": len(data), "hex": data[:MAX_BYTES].hex(), "segments": shown,
+            "truncated": len(data) > MAX_BYTES}
 
 
 def repo_summary(repo):
@@ -59,6 +67,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/api/repo":
                 body = repo_summary(self.repo)
+            elif url.path == "/api/bytes":
+                body = byte_map(self.repo, parse_qs(url.query).get("of", [""])[0])
             elif url.path == "/api/object":
                 body = object_detail(self.repo, parse_qs(url.query).get("sha", [""])[0])
             else:
