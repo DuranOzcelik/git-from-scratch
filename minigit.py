@@ -5,6 +5,7 @@ with minigit can be opened with git, and the other way round.
 
     python minigit.py init | add <path>... | status | commit -m <msg> | log
     python minigit.py cat-file (-p|-t) <object> | ls-files | ls-tree <tree> | hash-object [-w] <file>
+    python minigit.py explain (index|<object>)     label every byte of the index or of an object
 """
 import argparse
 import hashlib
@@ -378,6 +379,85 @@ class Repo:
         return {key: sorted(value) for key, value in result.items()}
 
 
+def _segments(data, parts):
+    """Turns [(length, field, kind, value)] into segments with offsets and checks they cover `data`."""
+    segments, offset = [], 0
+    for length, name, kind, value in parts:
+        if length:
+            segments.append({"offset": offset, "length": length, "field": name, "kind": kind, "value": value})
+            offset += length
+    if offset != len(data):
+        raise GitError(f"byte map covers {offset} of {len(data)} bytes")
+    return segments
+
+
+def explain_index(repo):
+    """Labels every byte of .git/index. Returns (raw bytes, segments)."""
+    path = repo.git / "index"
+    if not path.exists():
+        raise GitError("there is no index yet: nothing has been staged")
+    data = path.read_bytes()
+    repo.read_index()  # validates the signature, version and checksum first
+    count = struct.unpack("!L", data[8:12])[0]
+    parts = [(4, "signature", "meta", data[:4].decode("ascii")),
+             (4, "version", "meta", str(struct.unpack("!L", data[4:8])[0])),
+             (4, "entry count", "meta", str(count))]
+    pos = 12
+    for _ in range(count):
+        f = ENTRY_HEAD.unpack_from(data, pos)
+        start = pos + ENTRY_HEAD.size
+        length = f[11] & 0xFFF
+        end = data.index(b"\0", start) if length == 0xFFF else start + length
+        name = data[start:end].decode("utf-8", errors="replace")
+        size = (ENTRY_HEAD.size + (end - start) + 8) // 8 * 8
+        stamp = lambda seconds: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(seconds))
+        parts += [(8, "ctime", "stat", f"{stamp(f[0])}, metadata changed"),
+                  (8, "mtime", "stat", f"{stamp(f[2])}, content changed"),
+                  (4, "dev", "stat", str(f[4])), (4, "ino", "stat", str(f[5])),
+                  (4, "mode", "mode", f"{f[6]:o}, regular file" + (", executable" if f[6] & 0o111 else "")),
+                  (4, "uid", "stat", str(f[7])), (4, "gid", "stat", str(f[8])),
+                  (4, "size", "stat", f"{f[9]} bytes on disk"),
+                  (20, "blob SHA-1", "sha", f[10].hex()),
+                  (2, "flags", "meta", f"path length {length}" + (" (longer, NUL-terminated)" if length == 0xFFF else "")),
+                  (end - start, "path", "name", name),
+                  (pos + size - end, "padding", "pad", f"pads the entry to {size} bytes, a multiple of 8")]
+        pos += size
+    parts += [(len(data) - 20 - pos, "extensions", "pad", "optional cached data, ignored by minigit"),
+              (20, "checksum", "check", f"SHA-1 of everything before it: {data[-20:].hex()}")]
+    return data, _segments(data, parts)
+
+
+def explain_object(repo, sha):
+    """Labels every byte of an object as it is stored (before zlib compression)."""
+    kind, body = repo.read_object(sha)
+    data = f"{kind} {len(body)}".encode() + b"\0" + body
+    parts = [(len(kind) + 1, "type", "meta", kind),
+             (len(str(len(body))), "content size", "meta", f"{len(body)} bytes"),
+             (1, "NUL", "pad", "end of the header")]
+    if kind == "tree":
+        pos = 0
+        while pos < len(body):
+            space, nul = body.index(b" ", pos), body.index(b"\0", pos)
+            mode, name = body[pos:space].decode(), body[space + 1:nul].decode("utf-8", errors="replace")
+            parts += [(space - pos + 1, "mode", "mode", mode + (", directory" if mode == "40000" else ", file")),
+                      (nul - space, "name", "name", name),
+                      (20, "SHA-1 (raw, not hex)", "sha", body[nul + 1:nul + 21].hex())]
+            pos = nul + 21
+    elif kind == "commit":
+        head, _, _ = body.partition(b"\n\n")
+        pos = 0
+        for line in head.split(b"\n"):
+            key = line.split(b" ", 1)[0].decode("ascii", errors="replace")
+            value = line.split(b" ", 1)[-1].decode("utf-8", errors="replace")
+            parts.append((len(line) + 1, key, "sha" if key in ("tree", "parent") else "name", value))
+            pos += len(line) + 1
+        parts += [(1, "blank line", "pad", "separates the headers from the message"),
+                  (len(body) - pos - 1, "message", "text", body[pos + 1:].decode("utf-8", errors="replace").strip())]
+    else:
+        parts.append((len(body), "content", "text", f"{len(body)} bytes of file content"))
+    return data, _segments(data, parts)
+
+
 def _format_time(stamp):
     seconds, zone = stamp.split(" ")
     offset = (int(zone[1:3]) * 60 + int(zone[3:5])) * 60 * (-1 if zone[0] == "-" else 1)
@@ -395,6 +475,7 @@ def main(argv=None):
     sub.add_parser("ls-files")
     sub.add_parser("write-tree")
     sub.add_parser("ls-tree").add_argument("object")
+    sub.add_parser("explain").add_argument("target", help="'index' or an object name")
     cat = sub.add_parser("cat-file")
     mode = cat.add_mutually_exclusive_group(required=True)
     mode.add_argument("-p", action="store_const", const="-p", dest="mode", help="print the content")
@@ -450,6 +531,13 @@ def main(argv=None):
                 sha = repo.read_commit(sha)["tree"]
             for mode, name, child in repo.read_tree(sha):
                 print(f"{int(mode):06d} {'tree' if mode == '40000' else 'blob'} {child}\t{name}")
+        elif args.command == "explain":
+            data, segments = (explain_index(repo) if args.target == "index"
+                              else explain_object(repo, repo.resolve(args.target)))
+            for segment in segments:
+                raw = data[segment["offset"]:segment["offset"] + segment["length"]]
+                shown = raw[:12].hex(" ") + (" .." if len(raw) > 12 else "")
+                print(f"{segment['offset']:>6}  {segment['length']:>5}  {segment['field']:<22} {shown:<39} {segment['value']}")
         elif args.command == "cat-file":
             sha = repo.resolve(args.object)
             kind, body = repo.read_object(sha)

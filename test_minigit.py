@@ -201,6 +201,55 @@ class AgainstRealGit(Base):
         self.assertEqual(sorted(repo.flatten_tree(tree)), ["docs/guide.md", "main.py"])
 
 
+class ByteMaps(Base):
+    def assert_covers(self, data, segments):
+        """Every byte belongs to exactly one segment: no gaps, no overlaps."""
+        position = 0
+        for segment in segments:
+            self.assertEqual(segment["offset"], position)
+            self.assertGreater(segment["length"], 0)
+            position += segment["length"]
+        self.assertEqual(position, len(data))
+
+    def test_index_map_labels_every_byte(self):
+        for name in ("a", "bb.txt", "dir/a-longer-name.py", "x" * 23):
+            self.write(name, name)
+        self.add(".")
+        data, segments = minigit.explain_index(self.repo)
+        self.assert_covers(data, segments)
+        self.assertEqual(data, (self.repo.git / "index").read_bytes())
+        paths = [s["value"] for s in segments if s["field"] == "path"]
+        self.assertEqual(paths, sorted(self.repo.read_index()))
+        for segment in (s for s in segments if s["field"] == "padding"):
+            raw = data[segment["offset"]:segment["offset"] + segment["length"]]
+            self.assertEqual(raw, b"\0" * len(raw))
+            self.assertTrue(1 <= len(raw) <= 8)
+        shas = [s["value"] for s in segments if s["field"] == "blob SHA-1"]
+        self.assertEqual(shas, [e.sha for e in self.repo.read_index().values()])
+
+    def test_object_maps_label_every_byte(self):
+        self.write("src/main.py", "print('hi')\n")
+        self.write("README.md", "# readme\n")
+        self.add(".")
+        commit = self.repo.commit("first\n\nbody line")
+        tree = self.repo.read_commit(commit)["tree"]
+        blob = self.repo.read_index()["README.md"].sha
+        for sha in (commit, tree, blob):
+            data, segments = minigit.explain_object(self.repo, sha)
+            self.assert_covers(data, segments)
+        _, segments = minigit.explain_object(self.repo, tree)
+        self.assertEqual([s["value"] for s in segments if s["field"] == "name"], ["README.md", "src"])
+        self.assertEqual([s["value"] for s in segments if s["kind"] == "sha"],
+                         [child for _, _, child in self.repo.read_tree(tree)])
+        _, segments = minigit.explain_object(self.repo, commit)
+        self.assertEqual(segments[3]["value"], tree)
+        self.assertEqual(segments[-1]["value"], "first\n\nbody line")
+
+    def test_index_map_needs_an_index(self):
+        with self.assertRaises(GitError):
+            minigit.explain_index(self.repo)
+
+
 class CommandLine(Base):
     def test_commands_and_exit_codes(self):
         previous = os.getcwd()
@@ -216,6 +265,8 @@ class CommandLine(Base):
         self.assertEqual(minigit.main(["status"]), 0)
         self.assertEqual(minigit.main(["log"]), 0)
         self.assertEqual(minigit.main(["cat-file", "-t", "HEAD"]), 0)
+        self.assertEqual(minigit.main(["explain", "index"]), 0)
+        self.assertEqual(minigit.main(["explain", "HEAD"]), 0)
         self.assertEqual(minigit.main(["commit", "-m", "nothing changed"]), 128)
         self.assertEqual(minigit.main(["add", "missing.txt"]), 128)
 
