@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>minigit explorer</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #2b323c; --text: #e6edf3; --muted: #8b949e;
+    --accent: #f0883e; --commit: #f0883e; --tree: #58a6ff; --blob: #3fb950; --bad: #f85149;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f6f8fa; --panel: #fff; --line: #d0d7de; --text: #1f2328; --muted: #59636e;
+            --accent: #bc4c00; --commit: #bc4c00; --tree: #0969da; --blob: #1a7f37; --bad: #cf222e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width: 1240px; margin: 0 auto; padding: 28px 16px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); }
+  .chain { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 16px; font: 13px var(--mono); }
+  .chip { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 2px 10px; }
+  .cols { display: grid; grid-template-columns: minmax(250px, 1fr) minmax(250px, 1fr) minmax(320px, 1.5fr); gap: 10px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  .scroll { max-height: 420px; overflow: auto; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  ul ul { margin-left: 16px; border-left: 1px solid var(--line); padding-left: 6px; }
+  button.row { display: flex; gap: 8px; align-items: baseline; width: 100%; text-align: left; font: inherit; color: inherit;
+               background: none; border: 0; border-radius: 6px; padding: 5px 8px; cursor: pointer; min-width: 0; }
+  button.row:hover { background: var(--bg); }
+  button.row[aria-current="true"] { background: var(--bg); box-shadow: inset 2px 0 0 var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .sha { font: 12px var(--mono); flex: none; }
+  .commit .sha, .t-commit { color: var(--commit); } .t-tree { color: var(--tree); } .t-blob { color: var(--blob); }
+  .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sub { display: block; font-size: 12px; color: var(--muted); }
+  .kind { font: 600 11px var(--mono); text-transform: uppercase; flex: none; width: 52px; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; margin: 0 0 12px; font-size: 13px; }
+  dt { color: var(--muted); } dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  pre { margin: 0; font: 12.5px/1.55 var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+        padding: 10px 12px; overflow: auto; max-height: 300px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
+  .lower { display: grid; grid-template-columns: 1.6fr 1fr; gap: 10px; margin-top: 10px; }
+  @media (max-width: 900px) { .lower { grid-template-columns: 1fr; } }
+  table { border-collapse: collapse; width: 100%; font: 12.5px var(--mono); }
+  th, td { text-align: left; padding: 5px 12px 5px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; }
+  .status-group { margin-bottom: 10px; }
+  .status-group div { font: 13px var(--mono); }
+  .staged { color: var(--blob); } .unstaged { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>minigit explorer</h1>
+    <span class="muted" id="repo-name"></span>
+  </header>
+  <div class="chain" id="chain"></div>
+
+  <section class="cols">
+    <div class="panel"><h2>Commits</h2><div class="scroll"><ul id="commits"></ul></div></div>
+    <div class="panel"><h2>Tree of selected commit</h2><div class="scroll"><ul id="tree"></ul></div></div>
+    <div class="panel"><h2>Object</h2><div id="object" aria-live="polite"><p class="muted">Select a commit, folder or file.</p></div></div>
+  </section>
+
+  <section class="lower">
+    <div class="panel">
+      <h2>Index (staging area)</h2>
+      <div class="scroll"><table><thead><tr><th>Mode</th><th>Blob</th><th class="num">Bytes</th><th>Path</th></tr></thead>
+      <tbody id="index"></tbody></table></div>
+    </div>
+    <div class="panel"><h2>Status</h2><div id="status"></div></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+// repository content is written with textContent, never innerHTML
+const el = (tag, cls, text) => {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+};
+const short = (sha) => sha.slice(0, 7);
+const getObject = (sha) => fetch("/api/object?sha=" + encodeURIComponent(sha)).then((r) => r.json());
+
+function link(kind, sha, label) {
+  const row = el("button", "row");
+  row.append(el("span", "kind t-" + kind, kind), el("span", "sha", short(sha)), el("span", "grow", label || ""));
+  row.addEventListener("click", () => inspect(sha));
+  return row;
+}
+
+async function inspect(sha) {
+  const data = await getObject(sha);
+  const box = $("object");
+  if (data.error) { box.replaceChildren(el("p", "muted", data.error)); return; }
+  const facts = el("dl");
+  const ratio = data.size ? ` (${Math.round((data.compressed / (data.size + 1)) * 100)} % of raw)` : "";
+  [["Type", data.type], ["SHA-1", data.sha], ["Content", data.size + " bytes"],
+   ["On disk", data.compressed + " bytes, zlib" + ratio], ["File", data.file]]
+    .forEach(([k, v]) => facts.append(el("dt", "", k), el("dd", k === "Type" ? "t-" + data.type : "", v)));
+  const parts = [facts];
+  if (data.type === "commit") {
+    const links = el("div", "links");
+    links.append(link("tree", data.commit.tree, "root tree"));
+    data.commit.parents.forEach((p) => links.append(link("commit", p, "parent")));
+    parts.push(el("h2", "", "Points to"), links, el("h2", "", "Raw content"), el("pre", "", data.text));
+  } else if (data.type === "tree") {
+    const links = el("div", "links");
+    data.entries.forEach((e) => links.append(link(e.type, e.sha, e.mode + "  " + e.name)));
+    parts.push(el("h2", "", "Entries (mode, name → object)"), links);
+  } else if (data.binary) {
+    parts.push(el("p", "muted", "Binary content, not shown."));
+  } else {
+    parts.push(el("h2", "", "Content" + (data.truncated ? " (truncated)" : "")), el("pre", "", data.text));
+  }
+  box.replaceChildren(...parts);
+}
+
+async function treeList(sha) {
+  const data = await getObject(sha);
+  const list = el("ul");
+  for (const entry of data.entries || []) {
+    const item = el("li");
+    const row = el("button", "row");
+    const isTree = entry.type === "tree";
+    row.append(el("span", "kind t-" + entry.type, isTree ? "tree" : "blob"),
+      el("span", "grow", entry.name + (isTree ? "/" : "")), el("span", "sha muted", short(entry.sha)));
+    item.append(row);
+    if (isTree) item.append(await treeList(entry.sha)); // folders are trees that point to more trees
+    row.addEventListener("click", () => inspect(entry.sha));
+    list.append(item);
+  }
+  return list;
+}
+
+async function selectCommit(commit, row) {
+  document.querySelectorAll("#commits button").forEach((b) => b.removeAttribute("aria-current"));
+  row.setAttribute("aria-current", "true");
+  const root = el("li");
+  const rootRow = el("button", "row");
+  rootRow.append(el("span", "kind t-tree", "tree"), el("span", "grow", "/ (root)"), el("span", "sha muted", short(commit.tree)));
+  rootRow.addEventListener("click", () => inspect(commit.tree));
+  root.append(rootRow, await treeList(commit.tree));
+  $("tree").replaceChildren(root);
+  inspect(commit.sha);
+}
+
+async function load() {
+  const repo = await fetch("/api/repo").then((r) => r.json());
+  $("repo-name").textContent = repo.name;
+  const chain = [el("span", "chip", "HEAD")];
+  if (repo.ref) chain.push("→", el("span", "chip", repo.ref));
+  chain.push("→", el("span", "chip t-commit", repo.head ? "commit " + short(repo.head) : "no commits yet"));
+  if (repo.commits[0]) chain.push("→", el("span", "chip t-tree", "tree " + short(repo.commits[0].tree)));
+  $("chain").replaceChildren(...chain);
+
+  const rows = repo.commits.map((commit) => {
+    const item = el("li", "commit");
+    const row = el("button", "row");
+    const text = el("span", "grow", commit.subject);
+    text.append(el("span", "sub", commit.author + " · " + commit.date));
+    row.append(el("span", "sha", short(commit.sha)), text);
+    row.addEventListener("click", () => selectCommit(commit, row));
+    item.append(row);
+    return item;
+  });
+  $("commits").replaceChildren(...rows);
+  if (repo.commits[0]) selectCommit(repo.commits[0], rows[0].firstChild);
+
+  $("index").replaceChildren(...repo.index.map((entry) => {
+    const tr = el("tr");
+    tr.append(el("td", "", entry.mode), el("td", "t-blob", short(entry.sha)), el("td", "num", entry.size), el("td", "", entry.path));
+    return tr;
+  }));
+
+  const groups = [["Staged", "staged", [["new file", "staged_new"], ["modified", "staged_modified"], ["deleted", "staged_deleted"]]],
+                  ["Not staged", "unstaged", [["modified", "modified"], ["deleted", "deleted"]]],
+                  ["Untracked", "unstaged", [["", "untracked"]]]];
+  const blocks = [];
+  for (const [title, cls, kinds] of groups) {
+    const lines = kinds.flatMap(([label, key]) => repo.status[key].map((path) => (label ? label + ": " : "") + path));
+    if (!lines.length) continue;
+    const block = el("div", "status-group");
+    block.append(el("h2", "", title), ...lines.map((line) => el("div", cls, line)));
+    blocks.push(block);
+  }
+  $("status").replaceChildren(...(blocks.length ? blocks : [el("p", "muted", "Working tree clean.")]));
+}
+
+load();
+</script>
+</body>
+</html>
